@@ -1,0 +1,29 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <script>
+        function localWebSocketUri(path) {
+            var location = window.location;
+            var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+            return protocol + "//" + location.host + location.pathname + path;
+        }
+
+        console.log("Registering onload");
+        window.onload = function () {
+            var uri = localWebSocketUri("websocket");
+            console.log("Creating websocket for " + uri);
+            var websocket = new WebSocket(uri);
+            websocket.onmessage = function(event) {
+                console.log("The server said: ", event.data);
+            };
+            websocket.onopen = function() {
+                console.log("Socket opened successfuly");
+                websocket.send("Hello world");
+            };
+        };
+    </script>
+</head>
+<body>
+<div id="foo"></div>
+</body>
+</html>
