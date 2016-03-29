@@ -20,6 +20,12 @@
                 console.log("Socket opened successfuly");
                 websocket.send("Hello world");
             };
+            websocket.onclose = function(closeEvent) {
+                console.log("Closed");
+                console.log("Close code : ", closeEvent.code);
+                console.log("Close reason : ", closeEvent.reason);
+                console.log("Close clean : ", closeEvent.wasClean);
+            };
         };
     </script>
 </head>

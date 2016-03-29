@@ -99,12 +99,14 @@ module SignalS =
 
     type private AgentMessage =
     | SendText of string
+    | SendBinaryAsText of byte[]
     | SendBinary of byte []
+    | SendPong
     | Close
 
-    type private Agent = MailboxProcessor<AgentMessage * AsyncReplyChannel<unit>>
+    type private Agent = MailboxProcessor<AgentMessage * Option<AsyncReplyChannel<unit>>>
 
-    let private agentMain (webSocket : WebSocket) (finishedEvent : ManualResetEvent) (agent : Agent) =
+    let private agentMain (webSocket : WebSocket) (cancellation : CancellationToken) (finishedEvent : ManualResetEvent) (agent : Agent) =
         async {
             let mutable loop = true
         
@@ -118,25 +120,31 @@ module SignalS =
             }
 
             while loop do
-                let! (reception, replyChannel) = agent.Receive()
-                
-                match reception with
-                | Close -> loop <- false
-                | SendBinary data ->
-                    do! handleOp (webSocket.send Opcode.Binary data true)
-                | SendText str ->
-                    let data = System.Text.Encoding.UTF8.GetBytes(str)
-                    do! handleOp (webSocket.send Opcode.Text data true)
+                let! childResult = Async.TryStartChild (agent.Receive()) cancellation
+                match childResult with
+                | None -> loop <- false
+                | Some(reception, replyChannel) ->
+                    match reception with
+                    | Close -> loop <- false
+                    | SendBinary data -> do! handleOp (webSocket.send Opcode.Binary data true)
+                    | SendBinaryAsText data -> do! handleOp (webSocket.send Opcode.Text data true)
+                    | SendPong ->  do! handleOp (webSocket.send Opcode.Pong [||] true)
+                    | SendText str ->
+                        let data = System.Text.Encoding.UTF8.GetBytes(str)
+                        do! handleOp (webSocket.send Opcode.Text data true)
 
-                replyChannel.Reply ()
+                    match replyChannel with
+                    | Some replyChannel -> replyChannel.Reply ()
+                    | None -> ()
 
         } |> Async.TryFinallyAsync <|
         async {
             // Always try to send a close when finished
             do! webSocket.send Opcode.Close [||] true |> Async.Ignore
-        }  |> Async.TryFinallyAsync <|
+        } |> Async.TryFinallyAsync <|
         async {
             finishedEvent.Set() |> ignore
+            return ()
         }
 
     type IConnection =
@@ -144,38 +152,39 @@ module SignalS =
         abstract member Context : HttpContext
         abstract member SendText : string -> Async<unit>
         abstract member SendBinary : byte[] -> Async<unit>
-        abstract member Close : unit -> Async<unit>
+        abstract member SendClose : unit -> Async<unit>
+        abstract member PostText : string -> unit
+        abstract member PostBinary : byte[] -> unit
+        abstract member PostClose : unit -> unit
 
-    type internal InternalConnection =
+    type private Connection =
         {
             Id : ConnectionId
             Manager : ConnectionManager
             Socket : WebSocket
             Context : HttpContext
-            Agent : Agent
-            Cancellation : CancellationTokenSource
-            MailboxFinished : ManualResetEvent
+            PushAgent : Agent
+            PushAgentCancellation : CancellationTokenSource
+            PushAgentFinished : ManualResetEvent
         }
 
-        member this.SendAndIgnore opcode bs fin = async {
-            try
-                let! _ = this.Socket.send opcode bs fin
-                ()
-            with
-            | _ -> ()
-        }
+        member this.StartPushAgent () = this.PushAgent.Start ()
+
+        /// Post a message to the agent
+        member this.Post (message : AgentMessage) = this.PushAgent.Post (message, None)
+
+        /// Send a message to the agent & continue when processed
+        member this.Send (message : AgentMessage) = this.PushAgent.PostAndAsyncReply (fun r -> message, Some r)
 
         interface IConnection with
             member this.Id = this.Id
             member this.Context = this.Context
-            member this.SendText (text : string) =
-                this.Agent.PostAndAsyncReply (fun r -> SendText text, r)
-            
-            member this.SendBinary (data : byte[]) =
-                this.Agent.PostAndAsyncReply (fun r -> SendBinary data, r)
-
-            member this.Close () =
-                this.Agent.PostAndAsyncReply (fun r -> Close, r)
+            member this.PostText (text : string) = this.Post (SendText text)
+            member this.PostBinary (data : byte[]) = this.Post (SendBinary data)
+            member this.PostClose () = this.Post Close
+            member this.SendText (text : string) = this.Send (SendText text)
+            member this.SendBinary (data : byte[]) = this.Send (SendBinary data)
+            member this.SendClose () = this.Send Close
 
     and ConnectionEvent =
     | Connected
@@ -186,26 +195,26 @@ module SignalS =
     and ConnectionEventHandler = IConnection -> ConnectionEvent -> Async<unit>
 
     and ConnectionManager(eventHandler : ConnectionEventHandler) as this =
-        let connections = new ConcurrentDictionary<ConnectionId, InternalConnection>()
+        let connections = new ConcurrentDictionary<ConnectionId, Connection>()
         
         let mkConnection webSocket ctx =
             let mailboxFinished = new ManualResetEvent(false)
             let mailboxCancellation = new CancellationTokenSource()
-            let mailbox = new Agent(agentMain webSocket mailboxFinished, cancellationToken = mailboxCancellation.Token)
+            let mailbox = new Agent(agentMain webSocket mailboxCancellation.Token mailboxFinished, cancellationToken = mailboxCancellation.Token)
             {
                 Id = ConnectionId (Guid.NewGuid())
                 Manager = this
                 Socket = webSocket
                 Context = ctx
-                Agent = mailbox
-                Cancellation = mailboxCancellation
-                MailboxFinished = mailboxFinished
+                PushAgent = mailbox
+                PushAgentCancellation = mailboxCancellation
+                PushAgentFinished = mailboxFinished
             }
 
         let disposeConnection connection = 
-            (connection.Agent :> IDisposable).Dispose()
-            connection.Cancellation.Dispose()
-            connection.MailboxFinished.Dispose()
+            (connection.PushAgent :> IDisposable).Dispose()
+            connection.PushAgentCancellation.Dispose()
+            connection.PushAgentFinished.Dispose()
 
         let createConnection webSocket ctx =
             let connection = mkConnection webSocket ctx
@@ -217,6 +226,8 @@ module SignalS =
 
         let websocketApp (webSocket : WebSocket) (ctx : HttpContext) =
             let connection = createConnection webSocket ctx
+            connection.StartPushAgent()
+
             socket {
                 do! eventHandler connection Connected |> Sockets.SocketOp.ofAsync
                 let mutable loop = true
@@ -230,20 +241,16 @@ module SignalS =
                         do! eventHandler connection (TextReceived text) |> Sockets.SocketOp.ofAsync
                     | (Binary, data, true) ->
                         do! eventHandler connection (BinaryReceived data) |> Sockets.SocketOp.ofAsync
-                    | (Ping, _, _) -> do! webSocket.send Pong [||] true
+                    | (Ping, _, _) -> connection.Post SendPong
                     | (Opcode.Close, _, _) -> 
                         loop <- false
                     | _ -> ()
-            } |> SocketOpUtils.tryFinally <|
-            socket {
-                printfn "Finallized ?"
-                return ()
             } |> Async.TryFinallyAsync <|
             async {
                 // Signal the mailbox to end the show
-                connection.Cancellation.Cancel()
+                connection.PushAgentCancellation.Cancel()
                 // Wait for the mailbox to have sent the 'Close' or at least tryied to
-                do! connection.MailboxFinished |> Async.AwaitWaitHandle |> Async.Ignore
+                do! connection.PushAgentFinished |> Async.AwaitWaitHandle |> Async.Ignore
                 disposeConnection connection
                 removeConnection connection
                 do! eventHandler connection (Closed)
@@ -251,23 +258,21 @@ module SignalS =
 
         let connectionsSeq = seq { for c in connections do yield c.Value }
 
-        let broadcast opcode bs fin =
-            for connection in connectionsSeq do
-                connection.SendAndIgnore opcode bs fin |> Async.Start
-
         new() = ConnectionManager(fun _ _ -> async {()})
 
-        member this.WebPart : WebPart = handShake websocketApp
+        member __.WebPart : WebPart = handShake websocketApp
 
-        member this.BroadcastText (text : string) =
+        member __.BroadcastText (text : string) =
             let bytes = System.Text.Encoding.UTF8.GetBytes(text)
-            broadcast Text bytes true
+            for connection in connectionsSeq do
+                connection.Post (SendBinaryAsText bytes)
 
-        member this.BroadcastBinary (data : byte []) =
-            broadcast Binary data true
-            (*
-        member this.AllConnections
-            with get() = connections.Values |> List.ofSeq*)
+        member __.BroadcastBinary (data : byte []) =
+            for connection in connectionsSeq do
+                connection.Post (SendBinary data)
+            
+        member __.AllConnections
+            with get() = connections.Values |> Seq.map (fun c -> c :> IConnection)|> List.ofSeq
 
     let pullWebSocket handler =
         let manager = new ConnectionManager(handler)
